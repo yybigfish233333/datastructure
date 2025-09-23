@@ -1,0 +1,171 @@
+#include <iostream>
+#include <vector>
+#include <list>
+#include <functional>
+#include <mutex>
+#include <shared_mutex>
+#include <thread>
+#include <atomic>
+
+std::mutex cout_mutex;
+
+template<typename Key, typename Value>
+class threadSafeHashTable {
+private:
+    struct KeyValuePair {
+        Key   k_;
+        Value v_;
+        KeyValuePair(const Key& k, const Value& v) : k_(k), v_(v) {}
+    };
+
+    struct Bucket {
+        std::list<KeyValuePair> data;
+        mutable std::shared_mutex mutex; // 分桶锁
+    };
+
+    // ---- 核心：表级读写锁（共享/独占） ----
+    mutable std::shared_mutex table_mtx;
+
+    std::vector<Bucket> buckets;
+    std::atomic<size_t> sz{ 0 };
+    const float load_factor_threshold = 0.75f;
+
+    size_t getBucketIndex(const Key& k) const {
+        // 读 buckets.size() 时，要求外层已持有 table_mtx 的共享或独占锁
+        return std::hash<Key>{}(k) % buckets.size();
+    }
+
+    // 仅在已持有 table_mtx 的“独占锁”情况下调用
+    void rehash_unsafe(size_t new_bucket_count) {
+        // 在独占锁保护下，无需再拿各桶锁：其他线程无法获得共享锁进入任何操作
+        std::vector<Bucket> new_buckets(new_bucket_count);
+
+        for (auto& old_bucket : buckets) {
+            // 不需要锁 old_bucket.mutex，因为持有表级独占锁
+            for (auto& kv : old_bucket.data) {
+                size_t new_index = std::hash<Key>{}(kv.k_) % new_buckets.size();
+                new_buckets[new_index].data.push_back(kv);
+            }
+        }
+        buckets.swap(new_buckets);
+    }
+
+    bool load_factor_exceeded() const {
+        // 需在表级共享或独占锁下调用
+        return static_cast<float>(sz.load(std::memory_order_relaxed)) / buckets.size()
+               > load_factor_threshold;
+    }
+
+public:
+    explicit threadSafeHashTable(size_t initial_size = 16)
+        : buckets(initial_size) {}
+
+    void insert(const Key& key, const Value& value) {
+        // 1) 表级共享锁：允许并发读/写（只要不触发重哈希）
+        std::shared_lock<std::shared_mutex> table_read_lock(table_mtx);
+
+        size_t index = getBucketIndex(key);
+        auto& bucket = buckets[index];
+
+        {
+            // 2) 桶级独占锁
+            std::unique_lock<std::shared_mutex> bucket_lock(bucket.mutex);
+
+            for (auto& kv : bucket.data) {
+                if (kv.k_ == key) {
+                    kv.v_ = value;
+                    return; // 不触发重哈希
+                }
+            }
+            bucket.data.emplace_back(key, value);
+            sz.fetch_add(1, std::memory_order_relaxed);
+        } // 先释放桶锁
+
+        // 3) 仅当需要扩容时，释放表级共享锁，再以独占锁进入重哈希（避免死锁）
+        if (load_factor_exceeded()) {
+            table_read_lock.unlock(); // 必须先放共享锁
+
+            std::unique_lock<std::shared_mutex> table_write_lock(table_mtx);
+            // 双检，避免不必要的扩容/竞争
+            if (load_factor_exceeded()) {
+                rehash_unsafe(buckets.size() * 2);
+            }
+            // table_write_lock 释放后，其他线程可继续
+        }
+    }
+
+    bool find_copy(const Key& key, Value& out) {
+        std::shared_lock<std::shared_mutex> table_read_lock(table_mtx);
+        size_t index = getBucketIndex(key);
+        auto& bucket = buckets[index];
+
+        std::shared_lock<std::shared_mutex> bucket_lock(bucket.mutex);
+        for (auto& kv : bucket.data) {
+            if (kv.k_ == key) {
+                out = kv.v_;              // 在持锁状态下拷贝一份
+                return true;              // 返回后锁释放也安全
+            }
+        }
+        return false; // 没找到
+    }
+
+
+    bool erase(const Key& key) {
+        // 表级共享锁
+        std::shared_lock<std::shared_mutex> table_read_lock(table_mtx);
+
+        size_t index = getBucketIndex(key);
+        auto& bucket = buckets[index];
+
+        // 桶级独占锁
+        std::unique_lock<std::shared_mutex> bucket_lock(bucket.mutex);
+        for (auto it = bucket.data.begin(); it != bucket.data.end(); ++it) {
+            if (it->k_ == key) {
+                bucket.data.erase(it);
+                sz.fetch_sub(1, std::memory_order_relaxed);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    size_t getSize() const {
+        // 只读原子值即可；或者也可在表级共享锁下读取以配合其他只读字段
+        return sz.load(std::memory_order_relaxed);
+    }
+};
+
+int main() {
+    threadSafeHashTable<int, int> table;
+    const int num_threads = 8;
+    const int num_ops = 1000;
+
+    auto worker = [&](int thread_id) {
+        for (int i = 0; i < num_ops; i++) {
+            int key = thread_id * num_ops + i;
+            table.insert(key, key * 2);
+
+            if (i % 10 == 0) {
+                table.erase(key - 5);
+            }
+
+            if (i % 20 == 0) {
+                int v = 0;
+                if (table.find_copy(key, v)) {
+                    std::lock_guard<std::mutex> lock(cout_mutex);
+                    std::cout << "value is " << v << std::endl;
+                }
+            }
+
+        }
+        };
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < num_threads; i++) {
+        threads.emplace_back(worker, i);
+    }
+    for (auto& t : threads) t.join();
+
+    std::cout << "Final size: " << table.getSize() << std::endl;
+    return 0;
+}
